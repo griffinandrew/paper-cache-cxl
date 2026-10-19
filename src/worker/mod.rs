@@ -314,6 +314,8 @@ pub(crate) use crate::worker::policy::migration_queue::pending as pending_migrat
 // owns for its policy worker, its migration consumers and `hybrid_stats`.
 pub(crate) use crate::worker::policy::migstats::Stats as MigStats;
 #[cfg(feature = "hybrid_cache_common")]
+pub(crate) use crate::worker::policy::migstats::t_ms as policy_migstats_t_ms;
+#[cfg(feature = "hybrid_cache_common")]
 pub(crate) use crate::worker::policy::migstats::{NB as MIGSTATS_BUCKETS, read as migstats_read};
 
 // The migration pipeline's per-key-bucket in-flight and landed counts, which

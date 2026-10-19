@@ -645,6 +645,8 @@ pub mod migration_queue {
 		//     therefore EXACT rather than merely probable. Comparing bytes
 		//     would not be: a `set` that wrote identical content is a
 		//     different value and must be rejected.
+		let lookup_start = crate::migprof::start();
+
 		let Some(old_value) = objects.get_ref(&key).map(|object| object.snapshot()) else {
 			stats.mig_gone.fetch_add(1, Ordering::Relaxed);
 			return false;
@@ -672,7 +674,15 @@ pub mod migration_queue {
 			}
 		}
 
+		let copy_start = crate::migprof::start();
+
 		let new_value = old_value.migrated_to(tier);
+
+		// The emulated slow tier: a promotion reads it, a demotion writes it.
+		let moved_bytes = new_value.bytes().len();
+		crate::migprof::emu_charge(moved_bytes, tier == Tier::Slow);
+
+		let swap_start = crate::migprof::start();
 
 		// P against B, as this copy leaves it (a promotion's charge is in P).
 		if let Some(gate) = gate {
@@ -736,6 +746,20 @@ pub mod migration_queue {
 
 			}
 		});
+
+		if let (Some(lookup), Some(copy), Some(swap)) = (lookup_start, copy_start, swap_start) {
+			let ns = |from: Instant, to: Instant| to.saturating_duration_since(from).as_nanos() as u64;
+			let now = Instant::now();
+
+			stats.prof.record_migration(
+				tier,
+				moved_bytes,
+				ns(lookup, copy),
+				ns(copy, swap),
+				ns(swap, now),
+				matches!(swapped, crate::removal::Swap::Swapped(())),
+			);
+		}
 
 		if let crate::removal::Swap::Swapped(()) = swapped {
 			stats.mig_applied.fetch_add(1, Ordering::Relaxed);
@@ -885,6 +909,9 @@ pub mod migration_queue {
 						// `RecvCounts::publish`'s deltas tolerate.
 						let spin = Duration::from_micros(spin_us());
 						let slot = &status.migstats().mq[index % MQ_SLOTS];
+
+						// `MIG_PROFILE`: this thread's slot of the profile.
+						crate::migprof::set_consumer_slot(index);
 						let mut recv_counts = RecvCounts::default();
 
 						// The completion flush below stays inside the
@@ -901,6 +928,12 @@ pub mod migration_queue {
 							// Test builds: a gate test's paused or paced consumers.
 							#[cfg(test)]
 							crate::gate::test_hooks::consumer_wait();
+
+							// Profiling only: held here while the cache's
+							// migrations are paused (`set_migrations_paused`).
+							status.migstats().prof.wait_while_paused();
+
+							let item_start = crate::migprof::start();
 
 							// Counted on every path out of this iteration.
 							let _done = CountOnDrop(&processed);
@@ -970,6 +1003,8 @@ pub mod migration_queue {
 								// completed means nothing was retired, and a declined
 								// migration frees its copy outright rather than deferring.
 							}
+
+							status.migstats().prof.record_item(item_start);
 						}
 
 						// Channel closed: publish whatever the last burst left.
@@ -1681,6 +1716,12 @@ pub mod migstats {
 		/// sampled.
 		pub diverge_tick: AtomicU64,
 
+		/// `MIG_PROFILE=1`: where the consumers', the worker's and the GETs'
+		/// time goes (`crate::migprof`), printed as `MIGPROF` lines after
+		/// these.
+		#[cfg(feature = "hybrid_cache_common")]
+		pub prof: crate::migprof::Prof,
+
 		/// Paces the periodic dump: the instant of the first call that checked
 		/// the clock, and the millisecond (since it) of the last dump.
 		start: OnceLock<Instant>,
@@ -1939,6 +1980,11 @@ pub mod migstats {
 			// fast-tier divergence. LAST, so every line above keeps its place.
 			#[cfg(feature = "hybrid_cache_common")]
 			lines.push(self.corrections_line(t_ms));
+
+			// The profile (`MIG_PROFILE=1`; none otherwise): `MIGPROF` lines,
+			// after every `MIGSTATS` line.
+			#[cfg(feature = "hybrid_cache_common")]
+			lines.extend(self.prof.lines(t_ms));
 
 			lines
 		}
@@ -3142,8 +3188,15 @@ where
 			#[cfg(all(test, feature = "hybrid_cache_common"))]
 			crate::gate::test_hooks::worker_hold();
 
+			#[cfg(feature = "hybrid_cache_common")]
+			let pass_start = crate::migprof::start();
+
 			events.clear();
 			events.extend(self.listener.try_iter());
+
+			// `MIG_PROFILE`: what this pass found waiting.
+			#[cfg(feature = "hybrid_cache_common")]
+			let pass_backlog = events.len();
 
 			// Whether this pass's slow-served hits may heal with the
 			// corrections off: the gate's configuration, once per pass.
@@ -3351,7 +3404,18 @@ where
 			#[cfg(test)]
 			self.status.record_policy_worker_pass();
 
+			#[cfg(feature = "hybrid_cache_common")]
+			let idle_start = {
+				let stats = self.status.migstats();
+				let (demote, promote) = stats.pending();
+				stats.prof.record_pass(pass_start, pass_backlog, pass_backlog, demote + promote);
+				crate::migprof::start()
+			};
+
 			self.delay_event_loop(now, has_current_set);
+
+			#[cfg(feature = "hybrid_cache_common")]
+			self.status.migstats().prof.record_idle(idle_start);
 		}
 	}
 }

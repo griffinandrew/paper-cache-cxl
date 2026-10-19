@@ -4299,3 +4299,28 @@ objects with values changing size and TTLs added/removed between sets) ends with
 live key's `base_size_for` of what it last holds plus the policy overhead; T9 (`phys_fast_identity`) holds P
 to the stacks' fast bytes through overwrites and back to its start after the cache drops, in the full suites
 built with `thin_header`.
+
+## Profiling the migration consumers (`MIG_PROFILE=1`) and an emulated slow tier (`EMU_SLOW=1`)
+
+`src/migprof.rs`, off by default (one `LazyLock<bool>` load per hook). Answers "what slows the
+migration threads": per consumer and direction, copies, bytes, and the time in the snapshot lookup
+(shard read guard), `migrated_to` (allocation + copy: `copy_gbps`) and the swap (shard write guard),
+plus superseded copies (dropped, never retried); per consumer, busy % of the window; the policy
+worker's busy %, event backlog and the queue depth it leaves (`starved_passes`: >= 64 events waiting
+and an empty queue); `get` latency histograms by served tier. Printed as `MIGPROF` lines after the
+`MIGSTATS` block, and through `PaperCache::migprof_lines()`; `migprof_reset()` starts a window and
+`set_migrations_paused()` holds the consumers (profiling only) so a window has no migration traffic.
+
+`EMU_SLOW=1` is a cost model for machines with no slow node: every slow-tier access (a migration's
+copy, a slow GET, a set built slow) also spins `max(FCFS reservation on one shared link of
+EMU_SLOW_LINK_GBPS, bytes / EMU_SLOW_THREAD_GBPS) + EMU_SLOW_LAT_NS`, writes costing
+`EMU_SLOW_WRITE_FACTOR`x. It validates that the profile separates per-thread limits from link
+contention; it says nothing about a real device. Never set it on the CXL machine.
+
+Driver: `tests/mig_profile.rs` (`#[ignore]`d; `MP_*` knobs in its doc): load, then three windows
+(mixed, GET-only, GET-only paused).
+
+Found while building it, not fixed: a consumer publishes promotions/demotions to `HybridStats` only
+when its channel momentarily drains (`receiver.is_empty()`), so under a sustained backlog
+`hybrid_stats().promotions`/`.demotions` stay near zero for the whole run (seen with one consumer:
+4 promotions reported against 900K landed). `MIGSTATS applied=` is unaffected.

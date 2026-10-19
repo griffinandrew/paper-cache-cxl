@@ -217,6 +217,12 @@ pub use crate::hybrid_stats::HybridStats;
 #[cfg(feature = "hybrid_cache_common")]
 pub mod phys;
 
+// Profiling of the migration consumers, the policy worker and the GETs by
+// tier, and an emulated slow tier for machines without one: `MIG_PROFILE=1`,
+// `EMU_SLOW=1`. See `migprof.rs`'s module doc.
+#[cfg(feature = "hybrid_cache_common")]
+pub mod migprof;
+
 // Re-exported so `PaperCache::tier_of`'s return type is nameable by callers
 // without reaching into the private `worker` module tree directly.
 //
@@ -625,6 +631,9 @@ where
 		// Take the value handle under the shard guard, release the guard, and
 		// only then copy. The prefetch (`crate::read_path`) is issued from the
 		// DRAM header before the checks read the first line it fetches.
+		#[cfg(feature = "hybrid_cache_common")]
+		let started = crate::migprof::start();
+
 		let knobs = crate::read_path::knobs();
 
 		let snapshot = match self.objects.get_ref(&hashed_key) {
@@ -649,7 +658,17 @@ where
 				self.status.incr_hits();
 				// The tier the copy below reads from: the snapshot's tag.
 				V::hit_served(&self.status, value.tier());
-				Ok(value.bytes().to_vec())
+				let bytes = value.bytes().to_vec();
+
+				#[cfg(feature = "hybrid_cache_common")]
+				if value.tier() == Tier::Slow {
+					crate::migprof::emu_charge(bytes.len(), false);
+				}
+
+				#[cfg(feature = "hybrid_cache_common")]
+				self.status.migstats().prof.record_get(value.tier(), started);
+
+				Ok(bytes)
 			},
 
 			None => {
@@ -2332,6 +2351,12 @@ where
 		// (`WorkerEvent::Set`).
 		let built = object.value().tier();
 
+		// A value built slow was written to the slow tier: the emulated link
+		// charges the bytes a migration of it would move.
+		if built == Tier::Slow {
+			crate::migprof::emu_charge(base_size.saturating_sub(dram_resident) as usize, true);
+		}
+
 		debug_assert_eq!(self.overhead_manager.base_size(&object), base_size, "base_size_for is base_size");
 		debug_assert_eq!(self.overhead_manager.dram_resident_size(&object), dram_resident);
 
@@ -2520,6 +2545,27 @@ where
 	/// were removed with the runtime-policy unification, leaving this one
 	/// `HybridStats` struct. The 8 size-split gauges read zero unless the
 	/// cache is running `LruSizedCompactHybrid`.
+	/// The `MIGPROF` lines of this cache's profile (`MIG_PROFILE=1`; empty
+	/// otherwise): see `migprof`'s module doc for what each field answers.
+	#[must_use]
+	pub fn migprof_lines(&self) -> Vec<String> {
+		self.status.migstats().prof.lines(crate::worker::policy_migstats_t_ms())
+	}
+
+	/// Zeroes the profile (`MIG_PROFILE=1`): starts a measurement window.
+	pub fn migprof_reset(&self) {
+		self.status.migstats().prof.reset();
+	}
+
+	/// PROFILING ONLY: holds this cache's migration consumers before their next
+	/// item while `paused`, so a window can be measured with no migration
+	/// traffic. The queue keeps growing meanwhile, and the stack already counts
+	/// the queued moves as done, so physical placement lags it until resumed;
+	/// a `flush` waits for a resume. Unpause before dropping the cache.
+	pub fn set_migrations_paused(&self, paused: bool) {
+		self.status.migstats().prof.set_paused(paused);
+	}
+
 	#[must_use]
 	pub fn hybrid_stats(&self) -> HybridStats {
 		self.status.hybrid_stats()
