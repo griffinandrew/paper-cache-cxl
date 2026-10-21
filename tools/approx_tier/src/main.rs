@@ -43,6 +43,21 @@ struct Config {
 	shift_frac:  f64, // fraction of ranks reshuffled at each shift
 	checkpoints: u64,
 	seed:        u64,
+	evict:       Evict,
+	evict_samples: usize, // keys sampled per eviction (evict=sampled|pool)
+}
+
+/// How the victim is chosen when the cache is full.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Evict {
+	/// The LRU list's tail: exact LRU (needs the per-object list).
+	Exact,
+	/// The oldest stamp among `evict_samples` random residents (no list: Redis's original
+	/// approximate LRU).
+	Sampled,
+	/// As `Sampled`, plus a 16-entry pool of the oldest candidates seen so far, kept across
+	/// evictions (Redis 3.0's eviction pool).
+	Pool,
 }
 
 impl Config {
@@ -64,6 +79,8 @@ impl Config {
 			shift_frac:  0.2,
 			checkpoints: 40,
 			seed:        1,
+			evict:       Evict::Exact,
+			evict_samples: 8,
 		};
 
 		for arg in std::env::args().skip(1) {
@@ -89,6 +106,13 @@ impl Config {
 				"shift_frac" => c.shift_frac = v.parse().unwrap(),
 				"checkpoints" => c.checkpoints = v.parse().unwrap(),
 				"seed" => c.seed = v.parse().unwrap(),
+				"evict" => c.evict = match v {
+					"exact" => Evict::Exact,
+					"sampled" => Evict::Sampled,
+					"pool" => Evict::Pool,
+					_ => panic!("evict=exact|sampled|pool"),
+				},
+				"evict_samples" => c.evict_samples = v.parse().unwrap(),
 				_ => panic!("unknown key {k}"),
 			}
 		}
@@ -212,6 +236,12 @@ struct Sim {
 	tstar:      f64,
 	tstar_seen: bool,
 
+	// residents as a vector, for random sampling (stands in for sampling the object map)
+	rset:  Vec<u32>,
+	rpos:  Vec<u32>,
+	pool:  Vec<u32>,
+	rng:   Rng,
+
 	now: u64,
 	c:   Counts,
 }
@@ -227,6 +257,7 @@ impl Sim {
 			.map(|k| splitmix(k ^ cfg.seed.rotate_left(17)) & ((1 << 24) - 1) < threshold)
 			.collect();
 		let mini_cap = (fast as f64 * cfg.rate) as u64;
+		let cfg_seed = cfg.seed.wrapping_mul(0xd6e8_feb8_6659_fd93) | 1;
 
 		Sim {
 			cfg,
@@ -252,6 +283,10 @@ impl Sim {
 			mini_cap,
 			tstar: 0.0,
 			tstar_seen: false,
+			rset: Vec::new(),
+			rpos: vec![NIL; n],
+			pool: Vec::new(),
+			rng: Rng(0x5eed_0f_e71c7 ^ cfg_seed),
 			now: 0,
 			c: Counts::default(),
 		}
@@ -281,6 +316,8 @@ impl Sim {
 			self.lru.push_front(k);
 			self.resident[ku] = true;
 			self.used += self.size[ku] as u64;
+			self.rpos[ku] = self.rset.len() as u32;
+			self.rset.push(k);
 			self.stamp[ku] = self.now;
 
 			// both placements admit to fast (the LRU hybrid's rule)
@@ -325,7 +362,7 @@ impl Sim {
 
 	fn evict(&mut self) {
 		while self.used > self.cap {
-			let v = self.lru.tail;
+			let v = self.victim();
 			let vu = v as usize;
 			if self.boundary == v { self.boundary = self.lru.prev[vu] }
 			if self.efast[vu] {
@@ -336,6 +373,41 @@ impl Sim {
 			self.lru.unlink(v);
 			self.resident[vu] = false;
 			self.used -= self.size[vu] as u64;
+			let i = self.rpos[vu] as usize;
+			let last = self.rset.pop().unwrap();
+			if last != v {
+				self.rset[i] = last;
+				self.rpos[last as usize] = i as u32;
+			}
+			self.rpos[vu] = NIL;
+		}
+	}
+
+	fn victim(&mut self) -> u32 {
+		match self.cfg.evict {
+			Evict::Exact => self.lru.tail,
+			Evict::Sampled => {
+				let mut best = NIL;
+				for _ in 0..self.cfg.evict_samples {
+					let k = self.rset[(self.rng.next() % self.rset.len() as u64) as usize];
+					if best == NIL || self.stamp[k as usize] < self.stamp[best as usize] { best = k }
+				}
+				best
+			},
+			Evict::Pool => {
+				// drop entries that left the cache; add fresh samples; keep the 16 oldest
+				let resident = &self.resident;
+				self.pool.retain(|&k| resident[k as usize]);
+				for _ in 0..self.cfg.evict_samples {
+					let k = self.rset[(self.rng.next() % self.rset.len() as u64) as usize];
+					if !self.pool.contains(&k) { self.pool.push(k) }
+				}
+				let stamp = &self.stamp;
+				self.pool.sort_unstable_by_key(|&k| std::cmp::Reverse(stamp[k as usize]));
+				let excess = self.pool.len().saturating_sub(16);
+				self.pool.drain(..excess);
+				self.pool.pop().unwrap() // the oldest stamp
+			},
 		}
 	}
 
@@ -545,8 +617,8 @@ fn main() {
 	let per = |x: u64| x as f64 / c.gets as f64;
 	let cps = c.cps.max(1) as f64;
 	println!(
-		"config keys={} requests={} alpha={} cache={}B fast={}B rate={} mini_cap={}B promote={} gap_mult={} sweep={} ewma={} shift_every={} shift_frac={}",
-		cfg.keys, cfg.requests, cfg.alpha, sim.cap, sim.fast, cfg.rate, sim.mini_cap,
+		"config evict={:?}/{} keys={} requests={} alpha={} cache={}B fast={}B rate={} mini_cap={}B promote={} gap_mult={} sweep={} ewma={} shift_every={} shift_frac={}",
+		cfg.evict, cfg.evict_samples, cfg.keys, cfg.requests, cfg.alpha, sim.cap, sim.fast, cfg.rate, sim.mini_cap,
 		if cfg.promote_gap { "gap" } else { "always" }, cfg.gap_mult, cfg.sweep, cfg.ewma, cfg.shift_every, cfg.shift_frac,
 	);
 	println!("hit_ratio            {:.4}", per(c.hits));

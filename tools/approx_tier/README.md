@@ -63,9 +63,26 @@ What T\* does add is that most demotions become proactive: forced demotions drop
 
 This is a real knob, and T\* sets it automatically for the workload. At `gap_mult=4` it removes 9–13% of migrations for a cost of 0.2–0.7 fast-hit points. At `gap_mult=1` it removes 46% of migrations for a cost of 5.2 points. Whether that trade pays off depends on what a migration costs on CXL against what a slow hit costs, which needs the real box.
 
+### Dropping the stack entirely: approximate eviction (`evict=sampled|pool`)
+
+With `evict=sampled`, the victim is the oldest stamp among `evict_samples` random residents. There is no list; the random pick stands in for sampling the object map. With `evict=pool`, the same samples also feed a 16-entry pool of the oldest candidates seen so far (Redis 3.0's eviction pool), and the victim is the oldest entry in the pool. Placement in all runs is T\* plus the backstop (`sweep=16`, `promote=always`).
+
+Overall hit ratio (exact LRU, then the change in points):
+
+| workload | exact | sampled, 5 | sampled, 8 | pool, 5 | pool, 8 |
+|---|---|---|---|---|---|
+| alpha 0.6 | 0.4974 | -0.45 | -0.21 | -0.19 | -0.08 |
+| alpha 0.9 | 0.7870 | -0.41 | -0.19 | -0.17 | -0.08 |
+| alpha 1.2 | 0.9700 | -0.05 | -0.02 | -0.02 | -0.01 |
+| alpha 0.9, shifting | 0.7793 | -0.40 | -0.19 | -0.16 | -0.07 |
+
+The fast-hit ratio is unchanged to four digits in every run. Evicted objects are old, so they are almost never fast.
+
+Per-object state with no stack is a 4 B stamp, plus the mini at `R` × the arena node (about 0.4 B/object at R = 1%). That compares with `ARENA_STACK_DRAM_OVERHEAD` = 40 B/object today. Not modelled: the cost of sampling a real object map (cheap with the merged store's slab, while DashMap has no random access), and a wider stamp clock.
+
 ## Caveats
 
 - The traces are synthetic (Zipf with a static size per key). PaperCache's trace files have not been run through this yet, and that is the next step. It needs no CXL hardware.
 - Byte movement, latency and queueing are not modelled: a migration counts as one event.
-- Eviction here is exact LRU for both placements. Making eviction approximate as well, which is what would remove the per-object list node, is untested.
+- Approximate eviction (above) is tested on synthetic traces only.
 - The CLOCK hand walks a swap-removed vector rather than a ring, which is fine for an estimate.
