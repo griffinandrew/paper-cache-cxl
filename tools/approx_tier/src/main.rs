@@ -194,6 +194,13 @@ struct Counts {
 	approx_promotions: u64,
 	approx_demotions: u64,
 	approx_forced:   u64,
+	// policy-worker work, in key-addressed touches (each a likely cache miss)
+	ops_list:        u64, // stack: list relinks on every access (exact)
+	ops_cursor:      u64, // stack: cursor steps to demote (exact)
+	ops_mini:        u64, // stackless: mini-stack relinks/evictions (sampled keys only)
+	ops_sweep:       u64, // stackless: objects the clock hand reads
+	ops_backstop:    u64, // stackless: objects the backstop samples
+	ops_evict:       u64, // stackless: objects eviction samples (sampled/pool)
 	// checkpoint sums
 	cps:             u64,
 	overlap:         f64, // bytes(approx & exact) / bytes(exact)
@@ -298,7 +305,9 @@ impl Sim {
 		let ku = k as usize;
 		let prev_stamp = self.stamp[ku];
 
+		self.c.ops_list += 1;
 		if self.sampled[ku] {
+			self.c.ops_mini += 1;
 			self.mini_access(k);
 		}
 
@@ -356,6 +365,7 @@ impl Sim {
 			self.efast[b as usize] = false;
 			self.efast_bytes -= self.size[b as usize] as u64;
 			self.c.exact_demotions += 1;
+			self.c.ops_cursor += 1;
 			self.boundary = self.lru.prev[b as usize];
 		}
 	}
@@ -390,6 +400,7 @@ impl Sim {
 				let mut best = NIL;
 				for _ in 0..self.cfg.evict_samples {
 					let k = self.rset[(self.rng.next() % self.rset.len() as u64) as usize];
+					self.c.ops_evict += 1;
 					if best == NIL || self.stamp[k as usize] < self.stamp[best as usize] { best = k }
 				}
 				best
@@ -400,6 +411,7 @@ impl Sim {
 				self.pool.retain(|&k| resident[k as usize]);
 				for _ in 0..self.cfg.evict_samples {
 					let k = self.rset[(self.rng.next() % self.rset.len() as u64) as usize];
+					self.c.ops_evict += 1;
 					if !self.pool.contains(&k) { self.pool.push(k) }
 				}
 				let stamp = &self.stamp;
@@ -454,6 +466,7 @@ impl Sim {
 				if self.aset.is_empty() { break }
 				if self.hand >= self.aset.len() { self.hand = 0 }
 				let k = self.aset[self.hand];
+				self.c.ops_sweep += 1;
 				if self.age(k) > self.tstar {
 					self.approx_unset_fast(k); // the last key lands at `hand`: look at it next
 					self.c.approx_demotions += 1;
@@ -470,6 +483,7 @@ impl Sim {
 			for _ in 0..8 {
 				if self.hand >= self.aset.len() { self.hand = 0 }
 				let k = self.aset[self.hand];
+				self.c.ops_backstop += 1;
 				if self.age(k) > best_age { best = k; best_age = self.age(k) }
 				self.hand += 1;
 			}
@@ -497,6 +511,7 @@ impl Sim {
 			self.mini.unlink(t);
 			self.in_mini[t as usize] = false;
 			self.mini_used -= self.size[t as usize] as u64;
+			self.c.ops_mini += 1;
 			evicted = true;
 		}
 
@@ -636,6 +651,12 @@ fn main() {
 	println!(
 		"tstar                final {:.0} reqs  mean_rel_err {:.4} (over {} checkpoints)",
 		sim.tstar, c.tstar_rel_err / c.tstar_cps.max(1) as f64, c.tstar_cps,
+	);
+	let stackless = c.ops_mini + c.ops_sweep + c.ops_backstop + c.ops_evict;
+	println!(
+		"worker_ops_per_req   stack {:.2} (relink {:.2} cursor {:.2})  stackless {:.2} (mini {:.3} sweep {:.2} backstop {:.2} evict {:.2})",
+		per(c.ops_list + c.ops_cursor), per(c.ops_list), per(c.ops_cursor),
+		per(stackless), per(c.ops_mini), per(c.ops_sweep), per(c.ops_backstop), per(c.ops_evict),
 	);
 	println!("elapsed              {:.1}s", start.elapsed().as_secs_f64());
 }
