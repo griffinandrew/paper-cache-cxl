@@ -1,0 +1,12 @@
+[package]
+name = "approx_tier"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Simulator: exact LRU tier cursor vs a sampled mini stack driving a recency threshold"
+
+# Standalone: not a member of the paper-cache package, no features, no deps.
+[workspace]
+
+[profile.release]
+debug = 1
