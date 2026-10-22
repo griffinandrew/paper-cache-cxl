@@ -44,6 +44,11 @@ struct Config {
 	checkpoints: u64,
 	seed:        u64,
 	evict:       Evict,
+	trace:       Option<String>, // a paper-benchmark trace (25-byte records); replaces the Zipf generator
+	limit:       u64,  // trace: stop after this many records (0 = all)
+	meta:        u32,  // bytes of per-object metadata charged with each value (cache and fast tier)
+	cache_bytes: u64,  // absolute C (0 = cache_frac of all bytes)
+	fast_bytes:  u64,  // absolute F (0 = fast_frac of C)
 	evict_samples: usize, // keys sampled per eviction (evict=sampled|pool)
 }
 
@@ -80,6 +85,11 @@ impl Config {
 			checkpoints: 40,
 			seed:        1,
 			evict:       Evict::Exact,
+			trace:       None,
+			limit:       0,
+			meta:        0,
+			cache_bytes: 0,
+			fast_bytes:  0,
 			evict_samples: 8,
 		};
 
@@ -112,6 +122,11 @@ impl Config {
 					"pool" => Evict::Pool,
 					_ => panic!("evict=exact|sampled|pool"),
 				},
+				"trace" => c.trace = Some(v.to_string()),
+				"limit" => c.limit = v.parse().unwrap(),
+				"meta" => c.meta = v.parse().unwrap(),
+				"cache_bytes" => c.cache_bytes = v.parse().unwrap(),
+				"fast_bytes" => c.fast_bytes = v.parse().unwrap(),
 				"evict_samples" => c.evict_samples = v.parse().unwrap(),
 				_ => panic!("unknown key {k}"),
 			}
@@ -185,6 +200,8 @@ impl List {
 
 #[derive(Default, Debug)]
 struct Counts {
+	reqs:            u64,
+	sets:            u64,
 	gets:            u64,
 	hits:            u64,
 	exact_fast_hits: u64,
@@ -257,8 +274,8 @@ impl Sim {
 	fn new(cfg: Config, size: Vec<u32>) -> Self {
 		let n = size.len();
 		let total: u64 = size.iter().map(|&s| s as u64).sum();
-		let cap = (total as f64 * cfg.cache_frac) as u64;
-		let fast = (cap as f64 * cfg.fast_frac) as u64;
+		let cap = if cfg.cache_bytes > 0 { cfg.cache_bytes } else { (total as f64 * cfg.cache_frac) as u64 };
+		let fast = if cfg.fast_bytes > 0 { cfg.fast_bytes } else { (cap as f64 * cfg.fast_frac) as u64 };
 		let threshold = (cfg.rate * (1u64 << 24) as f64) as u64;
 		let sampled = (0..n as u64)
 			.map(|k| splitmix(k ^ cfg.seed.rotate_left(17)) & ((1 << 24) - 1) < threshold)
@@ -299,10 +316,15 @@ impl Sim {
 		}
 	}
 
-	fn access(&mut self, k: u32) {
+	/// A request for key `k` whose value (with `meta`) is `size` bytes. A GET that misses is
+	/// admitted (read-through); a SET is admitted or overwrites. Only GETs count toward the hit
+	/// ratios.
+	fn access(&mut self, k: u32, size: u32, is_get: bool) {
 		self.now += 1;
-		self.c.gets += 1;
+		self.c.reqs += 1;
+		if is_get { self.c.gets += 1 } else { self.c.sets += 1 }
 		let ku = k as usize;
+		if self.size[ku] != size { self.set_size(k, size) }
 		let prev_stamp = self.stamp[ku];
 
 		self.c.ops_list += 1;
@@ -312,9 +334,11 @@ impl Sim {
 		}
 
 		if self.resident[ku] {
-			self.c.hits += 1;
-			if self.efast[ku] { self.c.exact_fast_hits += 1 }
-			if self.afast[ku] { self.c.approx_fast_hits += 1 }
+			if is_get {
+				self.c.hits += 1;
+				if self.efast[ku] { self.c.exact_fast_hits += 1 }
+				if self.afast[ku] { self.c.approx_fast_hits += 1 }
+			}
 
 			self.exact_hit(k);
 			self.lru.unlink(k);
@@ -338,8 +362,21 @@ impl Sim {
 			self.evict();
 		}
 
+		// an overwrite that grew can put the cache over C
+		if self.used > self.cap { self.evict() }
 		self.exact_settle();
 		self.approx_sweep();
+	}
+
+	fn set_size(&mut self, k: u32, new: u32) {
+		let ku = k as usize;
+		let old = self.size[ku] as u64;
+		let new64 = new as u64;
+		if self.resident[ku] { self.used = self.used - old + new64 }
+		if self.efast[ku] { self.efast_bytes = self.efast_bytes - old + new64 }
+		if self.afast[ku] { self.afast_bytes = self.afast_bytes - old + new64 }
+		if self.in_mini[ku] { self.mini_used = self.mini_used - old + new64 }
+		self.size[ku] = new;
 	}
 
 	// -- EXACT --
@@ -604,11 +641,32 @@ fn main() {
 		key_of.swap(i, j);
 	}
 
+	let start = Instant::now();
+
+	if let Some(path) = cfg.trace.clone() {
+		let (ids, sizes, gets, size0) = read_trace(&path, cfg.limit, cfg.meta);
+		let mut cfg = cfg.clone();
+		cfg.keys = size0.len();
+		cfg.requests = ids.len() as u64;
+		eprintln!("loaded {} records, {} keys in {:.1}s", ids.len(), size0.len(), start.elapsed().as_secs_f64());
+		let mut sim = Sim::new(cfg.clone(), size0);
+		let every = (cfg.requests / cfg.checkpoints.max(1)).max(1);
+		let warm = cfg.requests / 10;
+		for i in 0..ids.len() {
+			sim.access(ids[i], sizes[i], gets[i]);
+			if i as u64 >= warm && i as u64 % every == 0 {
+				sim.checkpoint();
+			}
+		}
+		report(&cfg, &sim, start);
+		return;
+	}
+
 	let zipf = Zipf::new(cfg.keys, cfg.alpha);
+	let size: Vec<u32> = size.into_iter().map(|s| s + cfg.meta).collect();
 	let mut sim = Sim::new(cfg.clone(), size);
 	let every = (cfg.requests / cfg.checkpoints.max(1)).max(1);
 	let warm = cfg.requests / 10; // checkpoints start after a 10% warm-up
-	let start = Instant::now();
 
 	for i in 0..cfg.requests {
 		if cfg.shift_every > 0 && i > 0 && i % cfg.shift_every == 0 {
@@ -621,28 +679,73 @@ fn main() {
 		}
 
 		let k = key_of[zipf.rank(rng.unit())];
-		sim.access(k);
+		let size = sim.size[k as usize];
+		sim.access(k, size, true);
 
 		if i >= warm && i % every == 0 {
 			sim.checkpoint();
 		}
 	}
 
+	report(&cfg, &sim, start);
+}
+
+/// Reads a paper-benchmark trace: 25-byte little-endian records of
+/// `timestamp u64 | command u8 (0 GET, 1 SET) | key u64 | value size u32 | ttl u32`.
+/// Keys are renumbered densely; each key's starting size is its first record's.
+fn read_trace(path: &str, limit: u64, meta: u32) -> (Vec<u32>, Vec<u32>, Vec<bool>, Vec<u32>) {
+	use std::collections::HashMap;
+	use std::io::Read;
+
+	let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+	let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+	let mut records = len / 25;
+	if limit > 0 { records = records.min(limit) }
+	let mut rdr = std::io::BufReader::with_capacity(1 << 22, file);
+
+	let mut id_of: HashMap<u64, u32> = HashMap::with_capacity((records / 4) as usize);
+	let (mut ids, mut sizes, mut gets) = (
+		Vec::with_capacity(records as usize),
+		Vec::with_capacity(records as usize),
+		Vec::with_capacity(records as usize),
+	);
+	let mut size0 = Vec::new();
+	let mut buf = [0u8; 25];
+
+	for _ in 0..records {
+		if rdr.read_exact(&mut buf).is_err() { break }
+		let cmd = buf[8];
+		let key = u64::from_le_bytes(buf[9..17].try_into().unwrap());
+		let size = u32::from_le_bytes(buf[17..21].try_into().unwrap()).max(1) + meta;
+		let next = id_of.len() as u32;
+		let id = *id_of.entry(key).or_insert(next);
+		if id == next { size0.push(size) }
+		ids.push(id);
+		sizes.push(size);
+		gets.push(cmd == 0);
+	}
+
+	(ids, sizes, gets, size0)
+}
+
+fn report(cfg: &Config, sim: &Sim, start: Instant) {
 	let c = &sim.c;
-	let per = |x: u64| x as f64 / c.gets as f64;
+	let per = |x: u64| x as f64 / c.gets.max(1) as f64;
+	let per_req = |x: u64| x as f64 / c.reqs.max(1) as f64;
 	let cps = c.cps.max(1) as f64;
 	println!(
 		"config evict={:?}/{} keys={} requests={} alpha={} cache={}B fast={}B rate={} mini_cap={}B promote={} gap_mult={} sweep={} ewma={} shift_every={} shift_frac={}",
 		cfg.evict, cfg.evict_samples, cfg.keys, cfg.requests, cfg.alpha, sim.cap, sim.fast, cfg.rate, sim.mini_cap,
 		if cfg.promote_gap { "gap" } else { "always" }, cfg.gap_mult, cfg.sweep, cfg.ewma, cfg.shift_every, cfg.shift_frac,
 	);
+	println!("requests             {} (gets {} sets {})  meta={}B", c.reqs, c.gets, c.sets, cfg.meta);
 	println!("hit_ratio            {:.4}", per(c.hits));
 	println!("fast_hit_ratio       exact {:.4}  approx {:.4}", per(c.exact_fast_hits), per(c.approx_fast_hits));
 	println!(
 		"migrations_per_kreq  exact {:.2} (promo {:.2} demo {:.2})  approx {:.2} (promo {:.2} demo {:.2}, forced {:.2})",
-		1e3 * per(c.exact_promotions + c.exact_demotions), 1e3 * per(c.exact_promotions), 1e3 * per(c.exact_demotions),
-		1e3 * per(c.approx_promotions + c.approx_demotions), 1e3 * per(c.approx_promotions),
-		1e3 * per(c.approx_demotions), 1e3 * per(c.approx_forced),
+		1e3 * per_req(c.exact_promotions + c.exact_demotions), 1e3 * per_req(c.exact_promotions), 1e3 * per_req(c.exact_demotions),
+		1e3 * per_req(c.approx_promotions + c.approx_demotions), 1e3 * per_req(c.approx_promotions),
+		1e3 * per_req(c.approx_demotions), 1e3 * per_req(c.approx_forced),
 	);
 	println!(
 		"fast_set             overlap {:.4} of exact bytes  extra {:.4} of F  approx_fill {:.4} of F",
@@ -655,8 +758,8 @@ fn main() {
 	let stackless = c.ops_mini + c.ops_sweep + c.ops_backstop + c.ops_evict;
 	println!(
 		"worker_ops_per_req   stack {:.2} (relink {:.2} cursor {:.2})  stackless {:.2} (mini {:.3} sweep {:.2} backstop {:.2} evict {:.2})",
-		per(c.ops_list + c.ops_cursor), per(c.ops_list), per(c.ops_cursor),
-		per(stackless), per(c.ops_mini), per(c.ops_sweep), per(c.ops_backstop), per(c.ops_evict),
+		per_req(c.ops_list + c.ops_cursor), per_req(c.ops_list), per_req(c.ops_cursor),
+		per_req(stackless), per_req(c.ops_mini), per_req(c.ops_sweep), per_req(c.ops_backstop), per_req(c.ops_evict),
 	);
 	println!("elapsed              {:.1}s", start.elapsed().as_secs_f64());
 }
