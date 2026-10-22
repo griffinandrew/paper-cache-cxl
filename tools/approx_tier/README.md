@@ -80,9 +80,25 @@ The fast-hit ratio is unchanged to four digits in every run. Evicted objects are
 
 Per-object state with no stack is a 4 B stamp, plus the mini at `R` × the arena node (about 0.4 B/object at R = 1%). That compares with `ARENA_STACK_DRAM_OVERHEAD` = 40 B/object today. Not modelled: the cost of sampling a real object map (cheap with the merged store's slab, while DashMap has no random access), and a wider stamp clock.
 
+### Meta kvcache traces (`trace=<file>`)
+
+`trace=` reads the benchmark's trace files: PBTRACE2 (the Meta traces: a 64-byte header, then `ts u64 | cmd u8 | key_len u8 | value_size u32 | ttl u32 | key`) or the fixed 25-byte records. A miss is admitted (read-through), and hits count GETs only. Run on mlsys-03 over the whole traces, with a 12 GiB cache and a 4 GiB fast tier (the benchmark's sizes); both traces are 100% GETs.
+
+| | 202206 fast-hit | 202401 fast-hit | worker ops/req |
+|---|---|---|---|
+| exact LRU stack | 0.9456 | 0.9216 | 1.05 / 1.07 |
+| T\* + hand (`sweep=4`) | 0.9453 | 0.9212 | 4.15 / 4.33 |
+| + `promote=gap gap_mult=4` | 0.9444 | 0.9199 | 4.13 / 4.31 |
+| backstop only (`sweep=0`) | 0.9452 | 0.9210 | 0.65 / 0.94 |
+
+All stackless runs use `evict=pool` and charge 55 B/object of metadata, against 90 B for the exact stack.
+- T\* error is 4.3% and 5.4%.
+- Overall hit ratio is 0.962 and 0.944, within 0.1 point of exact eviction.
+- The backstop alone is within 0.06 point of exact and does less worker work than the stack. On these traces, T\* buys no hit ratio.
+
 ## Caveats
 
-- The traces are synthetic (Zipf with a static size per key). PaperCache's trace files have not been run through this yet, and that is the next step. It needs no CXL hardware.
+- Real traces: only the two Meta kvcache traces so far, which have no SETs. Set pressure (the byte gate's waits) is not modelled.
 - Byte movement, latency and queueing are not modelled: a migration counts as one event.
 - Approximate eviction (above) is tested on synthetic traces only.
 - The CLOCK hand walks a swap-removed vector rather than a ring, which is fine for an estimate.

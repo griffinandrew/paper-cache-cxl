@@ -703,20 +703,41 @@ fn read_trace(path: &str, limit: u64, meta: u32) -> (Vec<u32>, Vec<u32>, Vec<boo
 	if limit > 0 { records = records.min(limit) }
 	let mut rdr = std::io::BufReader::with_capacity(1 << 22, file);
 
-	let mut id_of: HashMap<u64, u32> = HashMap::with_capacity((records / 4) as usize);
-	let (mut ids, mut sizes, mut gets) = (
-		Vec::with_capacity(records as usize),
-		Vec::with_capacity(records as usize),
-		Vec::with_capacity(records as usize),
-	);
+	// PBTRACE2 (the Meta traces): a 64-byte header, then variable-length records
+	// `ts u64 | cmd u8 | key_len u8 | value_size u32 | ttl u32 | key bytes`. Otherwise the
+	// benchmark's fixed 25-byte records with a u64 key.
+	let mut magic = [0u8; 8];
+	let pb = rdr.read_exact(&mut magic).is_ok() && &magic == b"PBTRACE2";
+	if pb {
+		let mut hdr = [0u8; 56];
+		rdr.read_exact(&mut hdr).expect("PBTRACE2 header");
+		records = if limit > 0 { limit } else { u64::MAX };
+	} else {
+		drop(rdr);
+		rdr = std::io::BufReader::with_capacity(1 << 22, std::fs::File::open(path).unwrap());
+	}
+
+	let mut id_of: HashMap<u64, u32> = HashMap::with_capacity(if pb { 1 << 20 } else { (records / 4) as usize });
+	let cap = if pb { 1 << 20 } else { records as usize };
+	let (mut ids, mut sizes, mut gets) = (Vec::with_capacity(cap), Vec::with_capacity(cap), Vec::with_capacity(cap));
+	let mut kbuf = [0u8; 255];
 	let mut size0 = Vec::new();
 	let mut buf = [0u8; 25];
 
 	for _ in 0..records {
-		if rdr.read_exact(&mut buf).is_err() { break }
-		let cmd = buf[8];
-		let key = u64::from_le_bytes(buf[9..17].try_into().unwrap());
-		let size = u32::from_le_bytes(buf[17..21].try_into().unwrap()).max(1) + meta;
+		let (cmd, key, raw) = if pb {
+			if rdr.read_exact(&mut buf[..18]).is_err() { break }
+			let klen = buf[9] as usize;
+			if rdr.read_exact(&mut kbuf[..klen]).is_err() { break }
+			// FNV-1a then splitmix: a 64-bit id per key string
+			let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+			for &b in &kbuf[..klen] { h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3) }
+			(buf[8], splitmix(h), u32::from_le_bytes(buf[10..14].try_into().unwrap()))
+		} else {
+			if rdr.read_exact(&mut buf).is_err() { break }
+			(buf[8], u64::from_le_bytes(buf[9..17].try_into().unwrap()), u32::from_le_bytes(buf[17..21].try_into().unwrap()))
+		};
+		let size = raw.max(1) + meta;
 		let next = id_of.len() as u32;
 		let id = *id_of.entry(key).or_insert(next);
 		if id == next { size0.push(size) }
